@@ -610,7 +610,7 @@ export class MainServer extends Server {
 				}
 			}
 
-			ctx.reject();
+			ctx.reject(['password']);
 		});
 
 		client.on('ready', () => {
