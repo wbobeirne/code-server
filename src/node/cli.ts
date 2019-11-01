@@ -11,7 +11,7 @@ import product from "vs/platform/product/common/product";
 import { ipcMain } from "vs/server/src/node/ipc";
 import { enableCustomMarketplace } from "vs/server/src/node/marketplace";
 import { MainServer } from "vs/server/src/node/server";
-import { AuthType, buildAllowedMessage, enumToArray, FormatType, generateCertificate, generatePassword, localRequire, open, unpackExecutables } from "vs/server/src/node/util";
+import { AuthType, buildAllowedMessage, enumToArray, FormatType, generateCertificate, generatePassword, localRequire, open, unpackExecutables, generateSshHostKey } from "vs/server/src/node/util";
 
 const { logger } = localRequire<typeof import("@coder/logger/out/index")>("@coder/logger/out/index");
 setUnexpectedErrorHandler((error) => logger.warn(error.message));
@@ -90,6 +90,7 @@ const startVscode = async (): Promise<void | void[]> => {
 		basePath: args["base-path"],
 		cert: args.cert,
 		certKey: args["cert-key"],
+		sshHostKey: args["ssh-host-key"],
 		openUri: extra.length > 1 ? extra[extra.length - 1] : undefined,
 		host: args.host,
 		password: process.env.PASSWORD,
@@ -109,6 +110,13 @@ const startVscode = async (): Promise<void | void[]> => {
 		const { cert, certKey } = await generateCertificate();
 		options.cert = cert;
 		options.certKey = certKey;
+	}
+
+	if (!options.sshHostKey && typeof options.sshHostKey !== "undefined") {
+		throw new Error(`--ssh-host-key cannot be blank`);
+	} else if (!options.sshHostKey) {
+		// Just use the SSL cert key by default
+		options.sshHostKey = await generateSshHostKey();
 	}
 
 	enableCustomMarketplace();

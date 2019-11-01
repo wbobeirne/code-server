@@ -9,6 +9,7 @@ import { Readable } from "stream";
 import * as tls from "tls";
 import * as url from "url";
 import * as util from "util";
+import * as sshTypes from "ssh2";
 import { Emitter } from "vs/base/common/event";
 import { sanitizeFilePath } from "vs/base/common/extpath";
 import { Schemas } from "vs/base/common/network";
@@ -67,6 +68,7 @@ import { AuthType, getMediaMime, getUriTransformer, localRequire, tmpdir } from 
 import { RemoteExtensionLogFileName } from "vs/workbench/services/remote/common/remoteAgentService";
 import { IWorkbenchConstructionOptions } from "vs/workbench/workbench.web.api";
 
+const ssh = localRequire<typeof import("ssh2")>("ssh2");
 const tarFs = localRequire<typeof import("tar-fs")>("tar-fs/index");
 const WSSender = localRequire<typeof import("ws/lib/sender")>("ws/lib/sender");
 const WSReceiver = localRequire<typeof import("ws/lib/receiver")>("ws/lib/receiver");
@@ -118,6 +120,7 @@ export interface ServerOptions {
 	readonly connectionToken?: string;
 	readonly cert?: string;
 	readonly certKey?: string;
+	readonly sshHostKey?: string;
 	readonly openUri?: string;
 	readonly host?: string;
 	readonly password?: string;
@@ -127,6 +130,7 @@ export interface ServerOptions {
 
 export abstract class Server {
 	protected readonly server: http.Server | https.Server;
+	protected readonly sshServer: sshTypes.Server | undefined;
 	protected rootPath = path.resolve(__dirname, "../../../../..");
 	protected serverRoot = path.join(this.rootPath, "/out/vs/server/src");
 	protected readonly allowedRequestPaths: string[] = [this.rootPath];
@@ -149,6 +153,20 @@ export abstract class Server {
 			}, this.onRequest);
 		} else {
 			this.server = http.createServer(this.onRequest);
+		}
+
+		if (this.options.sshHostKey) {
+			const hostKey = fs.readFileSync(this.options.sshHostKey);
+			const sshServer = new ssh.Server({ hostKeys: [hostKey] }, (client, info) => {
+				this.handleSSHConnection(client, info);
+			});
+			sshServer.listen(() => {
+				// TODO: Get in cli logger instead to get correct formatting + get rid of jank set timeout
+				setTimeout(() => {
+					console.log(`        - SSH server listening on localhost:${sshServer.address().port}`);
+				}, 20);
+			});
+			this.sshServer = sshServer;
 		}
 	}
 
@@ -188,6 +206,11 @@ export abstract class Server {
 		socket: net.Socket,
 		parsedUrl: url.UrlWithParsedQuery
 	): Promise<void>;
+
+	protected abstract handleSSHConnection(
+		client: sshTypes.Connection,
+		info: sshTypes.ClientInfo,
+	): void;
 
 	protected abstract handleRequest(
 		base: string,
@@ -342,7 +365,7 @@ export abstract class Server {
 
 		this.ensureGet(request);
 		const parsedUrl = request.url ? url.parse(request.url, true) : { query: {}};
-		const isSSH = parsedUrl.path === "/ssh";
+		const isSSH = parsedUrl.path === "/ssh" && !!this.sshServer;
 
 		if (!isSSH && !this.authenticate(request)) {
 			throw new HttpError("Unauthorized", HttpCode.Unauthorized);
@@ -527,9 +550,11 @@ export class MainServer extends Server {
 
 	protected async handleSSHSocket(socket: net.Socket, parsedUrl: url.UrlWithParsedQuery): Promise<void> {
 		this.heartbeat();
+		if (!this.sshServer) {
+			return;
+		}
 
-		// TODO: code-server needs to make its own SSH server, not rely on 22.
-		const sshSocket = net.connect(22, "localhost");
+		const sshSocket = net.connect(this.sshServer.address().port, "localhost");
 		const sender = new WSSender(socket);
 		const receiver = new WSReceiver('arraybuffer');
 
@@ -562,11 +587,54 @@ export class MainServer extends Server {
 
 		// WebSocket Receiver handlers
 		receiver.on('drain', () => {
-			console.log('resume');
 			socket.resume();
 		});
-		receiver.on('message', data => {
+		receiver.on('message', (data: ArrayBuffer) => {
 			sshSocket.write(Buffer.from(data));
+		});
+	}
+
+	protected handleSSHConnection(client: sshTypes.Connection) {
+		client.on('authentication', ctx => {
+			// Allow any auth if we have no password
+			if (!this.options.password) {
+				return ctx.accept();
+			}
+
+			// Otherwise require the same password as code-server
+			if (ctx.method === 'password') {
+				const optPass = Buffer.from(this.options.password);
+				const ctxPass = Buffer.from(ctx.password);
+				if (crypto.timingSafeEqual(optPass, ctxPass)) {
+					return ctx.accept();
+				}
+			}
+
+			ctx.reject();
+		});
+
+		client.on('ready', () => {
+			console.info('SSH connection authenticated');
+
+			client.on('session', accept => {
+				const session = accept();
+				// session.on('exec', (accept, _, info) => {
+				// 	accept();
+				// 	console.info(`Client executed command '${info.command}'`);
+				// });
+				// session.on('sftp', accept => {
+				// 	accept();
+				// 	console.info('Client SFTP session started');
+				// });
+				// session.on('auth-agent', accept => {
+				// 	accept();
+				// 	console.info('Client SSH agent forwarded');
+				// });
+				// session.on('pty', accept => {
+				// 	accept();
+				// 	console.info('Client PTY session started');
+				// });
+			});
 		});
 	}
 
